@@ -1,0 +1,710 @@
+import os
+import math
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import List, Dict, Tuple, Any, Optional
+
+import librosa
+import numpy as np
+import soundfile as sf
+from pydub import AudioSegment
+from faster_whisper import WhisperModel
+from deep_translator import GoogleTranslator
+from edge_tts import Communicate
+
+# ------------------------------------------------------------------------------
+# Language settings
+# ------------------------------------------------------------------------------
+
+LANGUAGE_CODE_MAP = {
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Hindi": "hi",
+    "Japanese": "ja",
+    "Portuguese": "pt",
+}
+
+VOICE_MAP = {
+    "English": {
+        "male": "en-US-GuyNeural",
+        "female": "en-US-JennyNeural",
+    },
+    "Spanish": {
+        "male": "es-ES-AlvaroNeural",
+        "female": "es-ES-ElviraNeural",
+    },
+    "French": {
+        "male": "fr-FR-HenriNeural",
+        "female": "fr-FR-DeniseNeural",
+    },
+    "German": {
+        "male": "de-DE-KasperNeural",
+        "female": "de-DE-KatjaNeural",
+    },
+    "Hindi": {
+        "male": "hi-IN-MadhurNeural",
+        "female": "hi-IN-SwaraNeural",
+    },
+    "Japanese": {
+        "male": "ja-JP-KeitaNeural",
+        "female": "ja-JP-NanamiNeural",
+    },
+    "Portuguese": {
+        "male": "pt-BR-AntonioNeural",
+        "female": "pt-BR-FranciscaNeural",
+    },
+}
+
+# ------------------------------------------------------------------------------
+# Data structures
+# ------------------------------------------------------------------------------
+
+class DubbingError(RuntimeError):
+    pass
+
+
+class TranscriptSegment:
+    def __init__(
+        self,
+        start_time: float,
+        end_time: float,
+        speaker_id: str,
+        original_text: str,
+        translated_text: str = "",
+        gender: str = "",
+        voice_name: str = "",
+        source_audio_path: str = "",
+    ):
+        self.start_time = float(start_time)
+        self.end_time = float(end_time)
+        self.speaker_id = speaker_id
+        self.original_text = original_text.strip()
+        self.translated_text = translated_text.strip()
+        self.gender = gender
+        self.voice_name = voice_name
+        self.source_audio_path = source_audio_path
+
+    @property
+    def duration(self) -> float:
+        return max(self.end_time - self.start_time, 0.1)
+
+    def to_dict(self):
+        return {
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "speaker_id": self.speaker_id,
+            "original_text": self.original_text,
+            "translated_text": self.translated_text,
+            "gender": self.gender,
+            "voice_name": self.voice_name,
+            "source_audio_path": self.source_audio_path,
+        }
+
+
+# ------------------------------------------------------------------------------
+# Utility functions
+# ------------------------------------------------------------------------------
+
+def run_command(command: List[str], cwd: Optional[str] = None) -> None:
+    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip() if result.stderr else ""
+        stdout = result.stdout.strip() if result.stdout else ""
+        raise DubbingError(
+            f"Command failed: {' '.join(command)}\nSTDOUT: {stdout}\nSTDERR: {stderr}"
+        )
+
+
+def ensure_clean_dir(directory: str) -> None:
+    Path(directory).mkdir(parents=True, exist_ok=True)
+
+
+def get_audio_duration_seconds(path: str) -> float:
+    try:
+        info = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return float(info.stdout.strip()) if info.stdout.strip() else 0.0
+    except Exception:
+        return 0.0
+
+
+def safe_delete(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------------------
+# Demucs stem separation
+# ------------------------------------------------------------------------------
+
+def extract_audio_from_video(video_path: str, output_audio_path: str) -> None:
+    ensure_clean_dir(os.path.dirname(output_audio_path))
+    run_command([
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        output_audio_path,
+    ])
+
+
+def separate_audio_stems(audio_path: str, output_dir: str) -> Tuple[str, str]:
+    """
+    Uses Demucs to separate vocals from the background.
+    Returns:
+        vocals_path, background_path
+    """
+    ensure_clean_dir(output_dir)
+
+    # Try CLI demucs with htdemucs. It usually creates:
+    # separated/htdemucs/<file_basename>/vocals.wav
+    # plus drums.wav, bass.wav, other.wav...
+    try:
+        run_command([
+            "demucs",
+            "--two-stems", "vocals",
+            "-n", "htdemucs",
+            "--out", output_dir,
+            audio_path,
+        ])
+    except Exception as exc:
+        raise DubbingError(f"Demucs separation failed: {exc}")
+
+    # Find the generated stem folder
+    candidates = []
+    for root, dirs, files in os.walk(output_dir):
+        if root.endswith("htdemucs") or "htdemucs" in root:
+            candidates.append(root)
+    # The actual path often looks like output_dir/htdemucs/<audio_basename>/
+    stem_root = None
+    for candidate in sorted(candidates):
+        if os.path.isdir(candidate):
+            stem_root = candidate
+            break
+
+    if stem_root is None:
+        # Some demucs versions store the stems in a child directory under output_dir.
+        generated_dirs = [os.path.join(output_dir, d) for d in os.listdir(output_dir) if os.path.isdir(os.path.join(output_dir, d))]
+        if generated_dirs:
+            stem_root = generated_dirs[0]
+
+    if stem_root is None:
+        raise DubbingError("Demucs did not create any output folders.")
+
+    file_pattern = os.path.basename(audio_path).rsplit(".", 1)[0]
+
+    # Find the specific output folder for this source file
+    actual_stem_dir = None
+    for root, dirs, files in os.walk(stem_root):
+        if file_pattern in root:
+            actual_stem_dir = root
+            break
+    if actual_stem_dir is None and os.path.isdir(os.path.join(stem_root, file_pattern)):
+        actual_stem_dir = os.path.join(stem_root, file_pattern)
+
+    if actual_stem_dir is None:
+        # Fallback: find any directory with .wav files
+        wav_dirs = []
+        for root, dirs, files in os.walk(stem_root):
+            if any(f.lower().endswith(".wav") for f in files):
+                wav_dirs.append(root)
+        if wav_dirs:
+            actual_stem_dir = wav_dirs[0]
+
+    if actual_stem_dir is None:
+        raise DubbingError("Could not locate Demucs output directory.")
+
+    vocals_path = os.path.join(actual_stem_dir, "vocals.wav")
+    if not os.path.exists(vocals_path):
+        for file_name in os.listdir(actual_stem_dir):
+            if "vocals" in file_name.lower() and file_name.lower().endswith(".wav"):
+                vocals_path = os.path.join(actual_stem_dir, file_name)
+                break
+
+    if not os.path.exists(vocals_path):
+        raise DubbingError("Demucs output did not include vocals.wav.")
+
+    background_path = os.path.join(actual_stem_dir, "background.wav")
+    background_wavs = []
+    for file_name in os.listdir(actual_stem_dir):
+        full_path = os.path.join(actual_stem_dir, file_name)
+        if file_name.lower().endswith(".wav") and "vocals" not in file_name.lower():
+            background_wavs.append(full_path)
+
+    if not background_wavs:
+        # Fallback: create a copy of the original audio as background if no stem files are found.
+        # In a real production system, this would be replaced by more robust stem separation.
+        background_path = os.path.join(actual_stem_dir, "background.wav")
+        shutil.copy2(audio_path, background_path)
+    else:
+        mixed_background = None
+        for stem_path in background_wavs:
+            seg = AudioSegment.from_wav(stem_path)
+            if mixed_background is None:
+                mixed_background = seg
+            else:
+                mixed_background = mixed_background.overlay(seg)
+
+        if mixed_background is None:
+            raise DubbingError("Background stem mix is empty.")
+
+        mixed_background.export(background_path, format="wav")
+
+    return vocals_path, background_path
+
+
+# ------------------------------------------------------------------------------
+# Speaker diarization and gender detection
+# ------------------------------------------------------------------------------
+
+def estimate_pitch_frequency(audio_data: np.ndarray, sr: int) -> float:
+    try:
+        # A practical F0 estimator for speech.
+        f0 = librosa.yin(
+            audio_data.astype(np.float32),
+            fmin=50,
+            fmax=400,
+            sr=sr
+        )
+        f0 = f0[np.isfinite(f0)]
+        if len(f0) == 0:
+            return 0.0
+        return float(np.median(f0))
+    except Exception:
+        return 0.0
+
+
+def detect_gender_from_audio(audio_path: str) -> str:
+    try:
+        y, sr = librosa.load(audio_path, sr=None, mono=True)
+        if len(y) == 0:
+            return "female"
+        pitch = estimate_pitch_frequency(y, sr)
+        return "male" if pitch < 165 else "female"
+    except Exception:
+        return "female"
+
+
+def crop_segment_audio(audio_path: str, start_time: float, end_time: float, out_path: str) -> None:
+    ensure_clean_dir(os.path.dirname(out_path))
+    run_command([
+        "ffmpeg",
+        "-y",
+        "-ss", str(start_time),
+        "-to", str(end_time),
+        "-i", audio_path,
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        out_path,
+    ])
+
+
+def assign_speaker_ids_from_segments(vocal_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Very lightweight diarization approach:
+    - estimate pitch for each segment
+    - cluster by pitch consistency and energy
+    - assign speaker ids deterministically in order
+    """
+    if not vocal_segments:
+        return []
+
+    assigned = []
+    current_speaker = None
+    current_pitch = None
+    for idx, seg in enumerate(vocal_segments):
+        audio_path = seg.get("audio_path")
+        if not audio_path or not os.path.exists(audio_path):
+            seg["speaker_id"] = f"speaker_{idx + 1}"
+            assigned.append(seg)
+            continue
+
+        y, sr = librosa.load(audio_path, sr=None, mono=True)
+        pitch = estimate_pitch_frequency(y, sr)
+        energy = float(np.mean(np.abs(y))) if len(y) else 0.0
+
+        if current_speaker is None:
+            current_speaker = "speaker_1"
+            current_pitch = pitch
+        else:
+            pitch_delta = abs(pitch - current_pitch) if pitch and current_pitch else 9999
+            energy_delta = abs(energy - (seg.get("energy", 0.0)))
+            if pitch_delta < 18 and energy_delta < 0.4:
+                # Same speaker
+                pass
+            else:
+                # New speaker start
+                current_speaker = f"speaker_{len({item['speaker_id'] for item in assigned}) + 1}"
+                current_pitch = pitch
+
+        seg["speaker_id"] = current_speaker
+        seg["energy"] = energy
+        assigned.append(seg)
+
+    return assigned
+
+
+# ------------------------------------------------------------------------------
+# Transcription
+# ------------------------------------------------------------------------------
+
+def transcribe_vocal_audio(vocals_path: str, language: str = "en") -> List[Dict[str, Any]]:
+    """
+    Returns list of segments with:
+    start, end, text
+    """
+    model = WhisperModel("base", device="cpu", compute_type="float32")
+    segments, _ = model.transcribe(vocals_path, language=language, word_timestamps=False, vad_filter=True)
+
+    result = []
+    for segment in segments:
+        if not segment.text or not segment.text.strip():
+            continue
+        result.append({
+            "start": float(segment.start),
+            "end": float(segment.end),
+            "text": segment.text.strip(),
+        })
+    return result
+
+
+def create_segment_audio_chunks(vocals_path: str, segments: List[Dict[str, Any]], temp_dir: str) -> List[Dict[str, Any]]:
+    chunked = []
+    for idx, seg in enumerate(segments):
+        chunk_path = os.path.join(temp_dir, f"segment_{idx:03d}.wav")
+        crop_segment_audio(vocals_path, float(seg["start"]), float(seg["end"]), chunk_path)
+        seg["audio_path"] = chunk_path
+        chunked.append(seg)
+    return chunked
+
+
+# ------------------------------------------------------------------------------
+# Translation
+# ------------------------------------------------------------------------------
+
+def translate_text_to_language(text: str, target_language: str) -> str:
+    if not text or not text.strip():
+        return ""
+
+    target_lang_code = LANGUAGE_CODE_MAP.get(target_language, "en")
+    try:
+        translated = GoogleTranslator(source="auto", target=target_lang_code).translate(text)
+        return translated.strip() if translated else text.strip()
+    except Exception:
+        # Fallback: return the original text if translation fails.
+        return text.strip()
+
+
+# ------------------------------------------------------------------------------
+# Edge TTS synthesis and alignment
+# ------------------------------------------------------------------------------
+
+def safe_get_voice_name(target_language: str, gender: str) -> str:
+    gender = (gender or "female").lower()
+    voices = VOICE_MAP.get(target_language, VOICE_MAP["English"])
+    return voices.get(gender, voices["female"])
+
+
+def synthesize_segment_audio(text: str, voice_name: str, output_wav: str) -> None:
+    ensure_clean_dir(os.path.dirname(output_wav))
+    communicate = Communicate(text=text, voice=voice_name)
+    # edge-tts saves a .mp3 by default when using save()
+    # We convert to WAV after.
+    temp_mp3 = output_wav.replace(".wav", ".mp3")
+    # Save the temp mp3
+    loop = communicate.get()
+    # communicate.get() is not a coroutine; for edge-tts it is an async generator.
+    # We wrap around asyncio to be compatible with typical usage.
+    import asyncio
+
+    async def _save():
+        async for chunk in communicate:
+            if chunk["type"] == "audio":
+                with open(temp_mp3, "wb") as f:
+                    f.write(chunk["data"])
+        return
+
+    try:
+        asyncio.run(_save())
+    except RuntimeError:
+        # Some environments already have an event loop, but this is inside a sync function.
+        asyncio.run(_save())
+    except Exception:
+        raise
+
+    if not os.path.exists(temp_mp3):
+        raise DubbingError(f"Failed to synthesize TTS for voice {voice_name}")
+
+    run_command([
+        "ffmpeg",
+        "-y",
+        "-i", temp_mp3,
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        output_wav,
+    ])
+    safe_delete(temp_mp3)
+
+
+def calculate_atempo_value(target_duration_s: float, source_duration_s: float) -> float:
+    if source_duration_s <= 0 or target_duration_s <= 0:
+        return 1.0
+    ratio = target_duration_s / source_duration_s
+    # FFmpeg atempo supports 0.5 <= speed <= 2.0 per filter
+    # If ratio exceeds this range, chain multiple atempo filters.
+    return float(max(0.5, min(2.0, ratio)))
+
+
+def build_atempo_filter(speed_ratio: float) -> str:
+    """
+    Build a chained atempo filter to support stretch values outside 0.5..2.0.
+    """
+    filters = []
+    current = float(speed_ratio)
+
+    while current > 2.0:
+        filters.append("atempo=2.0")
+        current /= 2.0
+    while current < 0.5:
+        filters.append("atempo=0.5")
+        current *= 2.0
+
+    filters.append(f"atempo={current:.6f}")
+    return ",".join(filters)
+
+
+def stretch_audio_to_fit(source_wav: str, target_duration_s: float, output_wav: str) -> None:
+    """
+    Resizes synthesized clip to fit original timing window without changing pitch.
+    Uses FFmpeg atempo, which preserves pitch.
+    """
+    if not os.path.exists(source_wav):
+        raise DubbingError(f"Missing synthesized audio: {source_wav}")
+
+    src_duration = get_audio_duration_seconds(source_wav)
+    if src_duration <= 0:
+        raise DubbingError(f"Could not determine duration of source audio: {source_wav}")
+
+    ratio = target_duration_s / src_duration
+    if ratio <= 0:
+        ratio = 1.0
+
+    # Build repeated atempo chain if needed.
+    filter_chain = build_atempo_filter(ratio)
+
+    run_command([
+        "ffmpeg",
+        "-y",
+        "-i", source_wav,
+        "-af", filter_chain,
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        output_wav
+    ])
+
+
+# ------------------------------------------------------------------------------
+# Dialogue track assembly
+# ------------------------------------------------------------------------------
+
+def build_dialogue_track(segments: List[TranscriptSegment], work_dir: str) -> str:
+    """
+    Positions each aligned synthesized clip onto a silent audio track.
+    """
+    if not segments:
+        raise DubbingError("No speech segments available to build dialogue track.")
+
+    total_duration_ms = int(max(seg.end_time for seg in segments) * 1000) + 250
+    dialogue_track = AudioSegment.silent(duration=total_duration_ms, frame_rate=16000)
+
+    for seg in sorted(segments, key=lambda s: s.start_time):
+        if not seg.source_audio_path or not os.path.exists(seg.source_audio_path):
+            continue
+        clip = AudioSegment.from_wav(seg.source_audio_path)
+        start_ms = int(seg.start_time * 1000)
+        end_ms = int(seg.end_time * 1000)
+        clip = clip[: max(1, end_ms - start_ms)]
+        dialogue_track = dialogue_track.overlay(clip, position=start_ms)
+
+    output_path = os.path.join(work_dir, "dialogue_track.wav")
+    dialogue_track.export(output_path, format="wav")
+    return output_path
+
+
+# ------------------------------------------------------------------------------
+# Mixing and muxing
+# ------------------------------------------------------------------------------
+
+def mix_background_and_dialogue(background_wav: str, dialogue_wav: str, output_wav: str) -> None:
+    bg = AudioSegment.from_wav(background_wav)
+    dg = AudioSegment.from_wav(dialogue_wav)
+
+    max_duration_ms = max(len(bg), len(dg))
+    bg = bg[:max_duration_ms]
+    dg = dg[:max_duration_ms]
+
+    mixed = bg.overlay(dg)
+    mixed.export(output_wav, format="wav")
+
+
+def mux_audio_to_video(video_path: str, mixed_audio_path: str, output_video_path: str) -> None:
+    ensure_clean_dir(os.path.dirname(output_video_path))
+    run_command([
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-i", mixed_audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        output_video_path,
+    ])
+
+
+# ------------------------------------------------------------------------------
+# Lip-sync hook placeholder
+# ------------------------------------------------------------------------------
+
+def lip_sync_hook_placeholder(video_path: str, audio_path: str, output_dir: str) -> str:
+    """
+    Placeholder for future integration with Wav2Lip / Sync.so.
+    This function returns a path to the original video by default.
+    In a real implementation, replace this with your actual lip-sync pipeline.
+    """
+    return video_path
+
+
+# ------------------------------------------------------------------------------
+# Main orchestration
+# ------------------------------------------------------------------------------
+
+def process_video_for_dubbing(
+    video_path: str,
+    target_language: str,
+    work_dir: str,
+    progress_callback=None,
+) -> str:
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    if progress_callback:
+        progress_callback(0.05, "Validating inputs...")
+
+    video_name = Path(video_path).stem
+    base_dir = Path(work_dir)
+    output_dir = str(base_dir / "dubbed_output")
+    ensure_clean_dir(output_dir)
+
+    audio_dir = str(base_dir / "audio")
+    ensure_clean_dir(audio_dir)
+
+    temp_dir = str(base_dir / "tmp")
+    ensure_clean_dir(temp_dir)
+
+    # 1. Extract audio
+    original_audio = os.path.join(audio_dir, f"{video_name}_original.wav")
+    extract_audio_from_video(video_path, original_audio)
+    if progress_callback:
+        progress_callback(0.12, "Extracted audio from video.")
+
+    # 2. Demucs separation
+    demucs_dir = os.path.join(audio_dir, "demucs")
+    vocals_path, background_path = separate_audio_stems(original_audio, demucs_dir)
+    if progress_callback:
+        progress_callback(0.22, "Separated vocals and background audio.")
+
+    # 3. Transcribe vocals
+    language_code = LANGUAGE_CODE_MAP.get(target_language, "en")
+    segments = transcribe_vocal_audio(vocals_path, language=language_code)
+
+    if not segments:
+        raise DubbingError("No speech segments detected in the vocal track.")
+
+    segment_audios = create_segment_audio_chunks(vocals_path, segments, temp_dir)
+    segment_audios = assign_speaker_ids_from_segments(segment_audios)
+
+    if progress_callback:
+        progress_callback(0.35, "Transcription complete; assigning speaker IDs.")
+
+    # 4. Detect gender and translate
+    translated_segments: List[TranscriptSegment] = []
+    for idx, seg in enumerate(segment_audios):
+        # Create a temporary chunk for gender detection
+        gender_audio_path = os.path.join(temp_dir, f"gender_{idx:03d}.wav")
+        crop_segment_audio(vocals_path, float(seg["start"]), float(seg["end"]), gender_audio_path)
+        gender = detect_gender_from_audio(gender_audio_path)
+
+        translated_text = translate_text_to_language(seg["text"], target_language)
+        voice_name = safe_get_voice_name(target_language, gender)
+
+        translated_segments.append(
+            TranscriptSegment(
+                start_time=float(seg["start"]),
+                end_time=float(seg["end"]),
+                speaker_id=seg["speaker_id"],
+                original_text=seg["text"],
+                translated_text=translated_text,
+                gender=gender,
+                voice_name=voice_name,
+            )
+        )
+
+    if progress_callback:
+        progress_callback(0.48, "Gender detection and translation complete.")
+
+    # 5. Synthesize translated audio
+    for idx, seg in enumerate(translated_segments):
+        synthesized_wav = os.path.join(temp_dir, f"synth_{idx:03d}.wav")
+        synthesize_segment_audio(seg.translated_text, seg.voice_name, synthesized_wav)
+
+        target_duration = seg.duration
+        aligned_wav = os.path.join(temp_dir, f"aligned_{idx:03d}.wav")
+        stretch_audio_to_fit(synthesized_wav, target_duration, aligned_wav)
+
+        seg.source_audio_path = aligned_wav
+
+    if progress_callback:
+        progress_callback(0.68, "Synthesized and time-aligned translated dialogue.")
+
+    # 6. Build dialogue track
+    dialogue_track_path = build_dialogue_track(translated_segments, temp_dir)
+    if progress_callback:
+        progress_callback(0.75, "Built dialogue track.")
+
+    # 7. Mix background + dialogue
+    mixed_audio_path = os.path.join(output_dir, f"{video_name}_mixed.wav")
+    mix_background_and_dialogue(background_path, dialogue_track_path, mixed_audio_path)
+    if progress_callback:
+        progress_callback(0.82, "Mixed background and synthesized dialogue.")
+
+    # 8. Mux audio back to original video
+    final_output = os.path.join(output_dir, f"{video_name}_dubbed.mp4")
+    mux_audio_to_video(video_path, mixed_audio_path, final_output)
+    if progress_callback:
+        progress_callback(0.90, "Muxed audio back into the original video.")
+
+    # 9. Lip-sync placeholder
+    # This hook can be replaced with Wav2Lip or Sync.so integration later.
+    lip_sync_video = lip_sync_hook_placeholder(final_output, mixed_audio_path, output_dir)
+    if lip_sync_video != final_output and os.path.exists(lip_sync_video):
+        final_output = lip_sync_video
+
+    if progress_callback:
+        progress_callback(1.0, "Dubbing pipeline completed successfully.")
+
+    return final_output
